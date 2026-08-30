@@ -1,0 +1,6 @@
+path: ./real_eval
+train: images/val
+val: images/val
+names:
+  0: highlighter
+  1: scissors

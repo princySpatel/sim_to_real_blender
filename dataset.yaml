@@ -1,15 +1,4 @@
-# # C:/Users/princ/OneDrive/Desktop/blenderproj/dataset.yaml
-
-# # Paths to your generated folders
-# path: C:/Users/princ/OneDrive/Desktop/blenderproj/dataset
-# train: images/train
-# val: images/val
-
-# # Class Configuration
-# names:
-#   0: metallic_monkey
-
-path: C:/Users/princ/OneDrive/Desktop/blenderproj/dataset
+path: ./dataset
 train: images/train
 val: images/val
 

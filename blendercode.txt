@@ -1,0 +1,350 @@
+import bpy
+import bpy_extras
+import random
+import math
+import os
+import glob
+
+bl_info = {
+    "name": "SynthVision Master Engine",
+    "author": "Princy",
+    "version": (1, 4),
+    "blender": (4, 0, 0),
+    "category": "Development",
+}
+
+
+def generate_procedural_background(width=640, height=640):
+    """
+    Generates a background image directly in Blender (no external file needed) —
+    solid color, gradient, or random noise. This is the same idea used in the
+    original sim-to-real domain randomization research (Tobin et al.): since you
+    can't photograph every real-world surface, throwing in extreme, unrealistic
+    random textures forces the network to stop using background as a shortcut
+    and rely on actual object features instead.
+    """
+    import numpy as np
+    pattern = random.choice(["solid", "gradient", "noise"])
+    img = bpy.data.images.new("ProceduralBG", width=width, height=height, alpha=False)
+    pixels = np.ones((height, width, 4), dtype=np.float32)
+
+    if pattern == "solid":
+        color = [random.uniform(0.0, 1.0) for _ in range(3)]
+        pixels[:, :, 0] = color[0]
+        pixels[:, :, 1] = color[1]
+        pixels[:, :, 2] = color[2]
+    elif pattern == "gradient":
+        c1 = np.array([random.uniform(0.0, 1.0) for _ in range(3)])
+        c2 = np.array([random.uniform(0.0, 1.0) for _ in range(3)])
+        t = np.linspace(0.0, 1.0, height).reshape(height, 1, 1)
+        grad = c1.reshape(1, 1, 3) * (1 - t) + c2.reshape(1, 1, 3) * t
+        pixels[:, :, :3] = np.broadcast_to(grad, (height, width, 3))
+    else:  # noise
+        pixels[:, :, :3] = np.random.uniform(0.0, 1.0, (height, width, 3))
+
+    pixels[:, :, 3] = 1.0
+    img.pixels[:] = pixels.flatten()
+    return img
+
+
+def get_2d_bounding_box(obj, cam, scene):
+    mesh = obj.data
+    x_coords, y_coords = [], []
+    for vertex in mesh.vertices:
+        co_2d = bpy_extras.object_utils.world_to_camera_view(scene, cam, obj.matrix_world @ vertex.co)
+        x_coords.append(co_2d.x)
+        y_coords.append(co_2d.y)
+    box_width = max(x_coords) - min(x_coords)
+    box_height = max(y_coords) - min(y_coords)
+    center_x = min(x_coords) + (box_width / 2)
+    center_y = 1.0 - (max(y_coords) - (box_height / 2))
+    return (max(0, min(1, center_x)), max(0, min(1, center_y)), max(0, min(1, box_width)), max(0, min(1, box_height)))
+
+
+def randomize_material(obj, metallic_range, roughness_range):
+    """Jitter roughness/metallic on every material slot of obj, if it uses a Principled BSDF."""
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None or not mat.use_nodes:
+            continue
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is None:
+            continue
+        if "Metallic" in bsdf.inputs:
+            bsdf.inputs["Metallic"].default_value = random.uniform(*metallic_range)
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = random.uniform(*roughness_range)
+
+
+class SYNTH_OT_GenerateMultiClass(bpy.types.Operator):
+    bl_idname = "synth.generate_multiclass"
+    bl_label = "Run Multi-Class Randomization"
+
+    def execute(self, context):
+        scene = context.scene
+        props = scene.synth_properties
+
+        obj_highlighter = bpy.data.objects.get("highlighter")
+        obj_scissors = bpy.data.objects.get("scissors")
+        my_camera = bpy.data.objects.get("Camera")
+
+        if not obj_highlighter or not obj_scissors:
+            self.report({'ERROR'}, "Ensure objects are named 'highlighter' and 'scissors'!")
+            return {'CANCELLED'}
+
+        # Remember each object's original "home" location so we can jitter
+        # them apart for co-occurrence frames without losing the original setup.
+        base_loc_highlighter = obj_highlighter.location.copy()
+        base_loc_scissors = obj_scissors.location.copy()
+
+        # Empty used as a camera-tracking target when both objects are in frame,
+        # so the camera looks at the midpoint rather than favoring one object.
+        track_target = bpy.data.objects.get("SynthTrackTarget")
+        if track_target is None:
+            track_target = bpy.data.objects.new("SynthTrackTarget", None)
+            scene.collection.objects.link(track_target)
+
+        base_dir = os.path.abspath(bpy.path.abspath(props.output_path))
+        bg_dir = os.path.abspath(bpy.path.abspath(props.bg_path))
+
+        bg_files = []
+        for ext in ["*.jpg", "*.jpeg", "*.png"]:
+            bg_files.extend(glob.glob(os.path.join(bg_dir, ext)))
+
+        if not bg_files:
+            self.report({'ERROR'}, "No background images found!")
+            return {'CANCELLED'}
+
+        # Core Viewport & Transparency Configurations
+        scene.render.resolution_x = 640
+        scene.render.resolution_y = 640
+        scene.render.engine = 'BLENDER_EEVEE'
+        scene.render.film_transparent = True
+
+        # ------------------------------------------------------------------------
+        #    AUTOMATED COMPOSITOR NODE PIPELINE (Merges Render + BG Image)
+        # ------------------------------------------------------------------------
+        scene.use_nodes = True
+        nodes = scene.node_tree.nodes
+        links = scene.node_tree.links
+        nodes.clear()
+
+        node_render = nodes.new(type='CompositorNodeRLayers')
+        node_bg_image = nodes.new(type='CompositorNodeImage')
+        node_scale = nodes.new(type='CompositorNodeScale')
+        node_alpha = nodes.new(type='CompositorNodeAlphaOver')
+        node_composite = nodes.new(type='CompositorNodeComposite')
+
+        node_scale.space = 'RENDER_SIZE'
+        node_scale.frame_method = 'CROP'
+
+        links.new(node_bg_image.outputs['Image'], node_scale.inputs['Image'])
+        links.new(node_scale.outputs['Image'], node_alpha.inputs[1])
+        links.new(node_render.outputs['Image'], node_alpha.inputs[2])
+        links.new(node_alpha.outputs['Image'], node_composite.inputs['Image'])
+
+        # --- Main light (kept from original, but now a bit softer) ---
+        light_name = "SynthLight"
+        my_light = bpy.data.objects.get(light_name) or bpy.data.objects.new(
+            light_name, bpy.data.lights.new(name=light_name, type='POINT'))
+        if light_name not in scene.collection.objects:
+            scene.collection.objects.link(my_light)
+
+        # --- New: a second, dimmer fill light so shading isn't from one harsh point source ---
+        fill_light_name = "SynthFillLight"
+        my_fill_light = bpy.data.objects.get(fill_light_name) or bpy.data.objects.new(
+            fill_light_name, bpy.data.lights.new(name=fill_light_name, type='AREA'))
+        if fill_light_name not in scene.collection.objects:
+            scene.collection.objects.link(my_fill_light)
+        my_fill_light.data.size = 1.0
+
+        # --- New: soft ambient world light so metal surfaces get some diffuse fill too ---
+        world = scene.world
+        if world is None:
+            world = bpy.data.worlds.new("SynthWorld")
+            scene.world = world
+        world.use_nodes = True
+        bg_node = world.node_tree.nodes.get("Background")
+
+        total = props.total_images
+        print(f"\nMASTER ENGINE INITIALIZED: GENERATING {total} FULLY COMPOSITED FRAMES")
+
+        for i in range(total):
+            split = "train" if i < int(total * 0.8) else "val"
+            img_save_dir = os.path.join(base_dir, "images", split)
+            lbl_save_dir = os.path.join(base_dir, "labels", split)
+            os.makedirs(img_save_dir, exist_ok=True)
+            os.makedirs(lbl_save_dir, exist_ok=True)
+
+            # Mode selection: 1/3 highlighter alone, 1/3 scissors alone,
+            # 1/3 BOTH together (co-occurrence) so the model learns to
+            # discriminate the two classes within a single scene, not just
+            # recognize "an object" against a background.
+            mode = i % 3
+
+            if mode == 0:
+                objects_in_frame = [(obj_highlighter, 0)]
+                obj_highlighter.hide_render = False
+                obj_scissors.hide_render = True
+                obj_highlighter.location = base_loc_highlighter
+            elif mode == 1:
+                objects_in_frame = [(obj_scissors, 1)]
+                obj_highlighter.hide_render = True
+                obj_scissors.hide_render = False
+                obj_scissors.location = base_loc_scissors
+            else:
+                objects_in_frame = [(obj_highlighter, 0), (obj_scissors, 1)]
+                obj_highlighter.hide_render = False
+                obj_scissors.hide_render = False
+                sep_vec = mathutils_separation()
+                obj_highlighter.location = base_loc_highlighter + sep_vec
+                obj_scissors.location = base_loc_scissors - sep_vec
+                # How far apart the two objects ended up this frame — used below
+                # to scale the camera pullback so wider separations don't get
+                # clipped by the frame edge.
+                co_occurrence_spread = sep_vec.length
+
+            # Random background — mostly your real background photos, but ~20%
+            # of frames use a procedurally generated background (solid/gradient/
+            # noise) instead, to cover surface types no photo library will fully
+            # capture.
+            use_procedural = random.random() < 0.20
+            try:
+                if use_procedural:
+                    img = generate_procedural_background()
+                else:
+                    random_bg_path = random.choice(bg_files)
+                    img = bpy.data.images.load(random_bg_path, check_existing=True)
+                node_bg_image.image = img
+            except Exception:
+                continue
+
+            # Camera placement — widened radius range vs. the original version
+            # to expose the model to more object-scale variation (closer AND
+            # farther framings), which is what real phone photos need.
+            theta = random.uniform(0, 2 * math.pi)
+            phi = random.uniform(math.radians(35), math.radians(75))
+            radius = random.uniform(props.min_radius, props.max_radius)
+            if mode == 2:
+                # Scale the pullback with how far apart the objects landed this
+                # frame (co_occurrence_spread), instead of a fixed multiplier —
+                # a fixed value was too small on wide-separation frames, causing
+                # objects to clip off the edge of the image.
+                radius *= 1.1 + (co_occurrence_spread * 1.4)
+            my_camera.location = (
+                radius * math.sin(phi) * math.cos(theta),
+                radius * math.sin(phi) * math.sin(theta),
+                (radius * math.cos(phi)) + 0.05
+            )
+
+            track_constraint = my_camera.constraints.get("AutoTrack") or my_camera.constraints.new(type='TRACK_TO')
+            track_constraint.name = "AutoTrack"
+            track_constraint.track_axis = 'TRACK_NEGATIVE_Z'
+            track_constraint.up_axis = 'UP_Y'
+
+            if mode == 2:
+                # Look at the midpoint between both objects
+                mid = (obj_highlighter.location + obj_scissors.location) / 2
+                track_target.location = mid
+                track_constraint.target = track_target
+            else:
+                track_constraint.target = objects_in_frame[0][0]
+
+            # Main light shuffle (same style as original, slightly wider range)
+            my_light.location = (random.uniform(-0.4, 0.4), random.uniform(-0.4, 0.4), random.uniform(0.5, 1.2))
+            my_light.data.energy = random.uniform(30.0, 100.0)
+            my_light.data.color = (random.uniform(0.85, 1.0), random.uniform(0.85, 1.0), random.uniform(0.85, 1.0))
+
+            # Fill light shuffle — dimmer, positioned roughly opposite the main light
+            my_fill_light.location = (random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5), random.uniform(0.3, 0.9))
+            my_fill_light.data.energy = random.uniform(5.0, 25.0)
+            my_fill_light.data.color = (random.uniform(0.9, 1.0), random.uniform(0.9, 1.0), random.uniform(0.9, 1.0))
+
+            # Ambient world light shuffle — soft diffuse fill for reflective surfaces
+            if bg_node is not None:
+                strength = random.uniform(0.05, 0.35)
+                bg_node.inputs['Strength'].default_value = strength
+
+            # Material randomization on whichever object(s) are visible this frame
+            randomize_material(obj_highlighter, metallic_range=(0.0, 0.15), roughness_range=(0.25, 0.75))
+            randomize_material(obj_scissors, metallic_range=(0.3, 0.9), roughness_range=(0.1, 0.6))
+
+            bpy.context.view_layer.update()
+
+            file_base_name = f"synth_multiclass_{i:04d}"
+            scene.render.filepath = os.path.join(img_save_dir, f"{file_base_name}.jpg")
+            bpy.ops.render.render(write_still=True)
+
+            # Write one label line per object visible in this frame
+            lines = []
+            for obj, class_id in objects_in_frame:
+                cx, cy, bw, bh = get_2d_bounding_box(obj, my_camera, scene)
+                lines.append(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+            txt_path = os.path.join(lbl_save_dir, f"{file_base_name}.txt")
+            with open(txt_path, 'w') as f:
+                f.write("\n".join(lines))
+
+            bpy.data.images.remove(img)
+
+        self.report({'INFO'}, "Multi-class dataset generation successfully completed!")
+        return {'FINISHED'}
+
+
+def mathutils_separation():
+    """
+    Random direction + guaranteed-minimum-magnitude vector. Applied as +vec to
+    one object and -vec to the other. Raised the floor here (was 0.18) because
+    at lower magnitudes the objects' own length was still enough to cause
+    heavy overlap for some rotations.
+    """
+    import mathutils
+    angle = random.uniform(0, 2 * math.pi)
+    magnitude = random.uniform(0.28, 0.5)
+    return mathutils.Vector((
+        math.cos(angle) * magnitude,
+        math.sin(angle) * magnitude,
+        0.0
+    ))
+
+
+class SYNTH_MultiProperties(bpy.types.PropertyGroup):
+    total_images: bpy.props.IntProperty(name="Total Images", default=100, min=2)
+    output_path: bpy.props.StringProperty(name="Output Dataset Folder", default="C:/Users/princ/OneDrive/Desktop/blenderproj/dataset/", subtype='DIR_PATH')
+    bg_path: bpy.props.StringProperty(name="Background Images Folder", default="C:/Users/princ/OneDrive/Desktop/blenderproj/bg_images/", subtype='DIR_PATH')
+    min_radius: bpy.props.FloatProperty(name="Min Cam Dist", default=0.55)
+    max_radius: bpy.props.FloatProperty(name="Max Cam Dist", default=1.10)
+
+
+class SYNTH_PT_MultiPanel(bpy.types.Panel):
+    bl_label = "Multi-Class Domain Factory"
+    bl_idname = "SYNTH_PT_multi_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'SynthVision'
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.synth_properties
+
+        layout.label(text="Dataset Boundaries", icon='FILE_FOLDER')
+        box = layout.box()
+        box.prop(props, "total_images")
+        box.prop(props, "output_path")
+        box.prop(props, "bg_path")
+        box.prop(props, "min_radius")
+        box.prop(props, "max_radius")
+
+        layout.separator()
+        layout.operator("synth.generate_multiclass", text="Run Multi-Class Randomization", icon='RENDER_STILL')
+
+
+def register():
+    bpy.utils.register_class(SYNTH_MultiProperties)
+    bpy.utils.register_class(SYNTH_OT_GenerateMultiClass)
+    bpy.utils.register_class(SYNTH_PT_MultiPanel)
+    bpy.types.Scene.synth_properties = bpy.props.PointerProperty(type=SYNTH_MultiProperties)
+
+
+if __name__ == "__main__":
+    register()
