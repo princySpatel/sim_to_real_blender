@@ -23,11 +23,11 @@ A model trained purely on synthetic Blender renders — no real photos in traini
 
 | Synthetic training curves | Confusion matrix (synthetic val) |
 |---|---|
-| ![training curves](assets/results.png) | ![confusion matrix](assets/confusion_matrix_normalized.png) |
+| ![training curves](runs\detect\train-8\results.png) | ![confusion matrix](runs\detect\train-8\confusion_matrix_normalized.png) |
 
 | Before: real photo, baseline model | After: real photo, final model (train-8) |
 |---|---|
-| ![before](assets/before_real_prediction.jpg) | ![after](assets/after_real_prediction.jpg) |
+| ![before](checkpoint_comparison\train_pred.jpg) | ![after](checkpoint_comparison\train-8_pred.jpg) |
 
 *Baseline model on a real photo either detected nothing or mislabeled everything as one class; the final model (train-8) correctly identifies and localizes both objects.*
 
@@ -97,8 +97,6 @@ blenderproj/
 ├── LICENSE
 └── README.md
 ```
-
-Note: pretrained base weights (`yolov8n.pt`, `yolov8s.pt`, `yolo26n.pt`) are not committed — Ultralytics downloads these automatically on first run. Only the final trained checkpoint's weights (`train-8/weights/best.pt`) are kept in the repo; every other run's config/metrics/plots are kept for reference, but intermediate weight files are excluded to keep the repo lean. Repeated evaluation folders (`runs/detect/val-2` through `val-9`, generated automatically each time `.val()` was run) are also excluded — they're just re-runs of the same evaluation, not distinct results.
 
 ## Reproducing this
 
