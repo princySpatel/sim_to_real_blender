@@ -23,11 +23,11 @@ A model trained purely on synthetic Blender renders — no real photos in traini
 
 | Synthetic training curves | Confusion matrix (synthetic val) |
 |---|---|
-| ![training curves](runs\detect\train-8\results.png) | ![confusion matrix](runs\detect\train-8\confusion_matrix_normalized.png) |
+| ![training curves](runs/detect/train-8/results.png) | ![confusion matrix](runs/detect/train-8/confusion_matrix_normalized.png) |
 
 | Before: real photo, baseline model | After: real photo, final model (train-8) |
 |---|---|
-| ![before](checkpoint_comparison\train_pred.jpg) | ![after](checkpoint_comparison\train-8_pred.jpg) |
+| ![before](checkpoint_comparison/train_pred.jpg) | ![after](checkpoint_comparison/train-8_pred.jpg) |
 
 *Baseline model on a real photo either detected nothing or mislabeled everything as one class; the final model (train-8) correctly identifies and localizes both objects.*
 
